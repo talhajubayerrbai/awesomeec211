@@ -33,7 +33,6 @@ jobs:
     needs: [test]
     outputs:
       instance_id: ${{ steps.tf_outputs.outputs.instance_id }}
-      ssm_bucket_name: ${{ steps.tf_outputs.outputs.ssm_bucket_name }}
 
     steps:
       - name: Checkout
@@ -73,9 +72,7 @@ jobs:
         working-directory: terraform
         run: |
           INSTANCE_ID=$(terraform output -raw instance_id)
-          SSM_BUCKET=$(terraform output -raw ssm_bucket_name)
           echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
-          echo "ssm_bucket_name=${SSM_BUCKET}" >> "$GITHUB_OUTPUT"
 
   configure:
     name: Configure
@@ -121,7 +118,11 @@ jobs:
           ANSIBLE_HOST_KEY_CHECKING: "False"
           INSTANCE_ID: ${{ needs.provision.outputs.instance_id }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          SSM_BUCKET: ${{ needs.provision.outputs.ssm_bucket_name }}
+          # Reconstruct the bucket name from PROJECT_NAME directly — do NOT use
+          # needs.provision.outputs.ssm_bucket_name because GitHub Actions
+          # silently drops that output when it detects the PROJECT_NAME secret
+          # value as a substring, leaving it empty and breaking Ansible SSM.
+          SSM_BUCKET: ${{ secrets.PROJECT_NAME }}-ssm-transfer
         run: |
           ansible-playbook ansible/playbook.yml \
             -i "${INSTANCE_ID}," \
