@@ -242,6 +242,33 @@ resource "aws_iam_role_policy_attachment" "ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Inline policy granting the instance read/write access to the SSM transfer bucket
+resource "aws_iam_role_policy" "ssm_s3" {
+  name = "${var.project_name}-ssm-s3-policy"
+  role = aws_iam_role.ssm.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:GetEncryptionConfiguration"
+        ]
+        Resource = [
+          aws_s3_bucket.ssm.arn,
+          "${aws_s3_bucket.ssm.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
 resource "aws_iam_instance_profile" "ssm" {
   name = "${var.project_name}-ssm-profile"
   role = aws_iam_role.ssm.name
@@ -249,6 +276,28 @@ resource "aws_iam_instance_profile" "ssm" {
   tags = {
     Name = "${var.project_name}-ssm-profile"
   }
+}
+
+# 
+# S3 bucket for Ansible SSM connection plugin file transfer
+# The community.aws aws_ssm connection plugin requires a bucket to
+# stage files when communicating with the remote instance over SSM.
+# 
+resource "aws_s3_bucket" "ssm" {
+  bucket        = "${var.project_name}-ssm-transfer"
+  force_destroy = true
+
+  tags = {
+    Name = "${var.project_name}-ssm-transfer"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "ssm" {
+  bucket                  = aws_s3_bucket.ssm.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
 # 
@@ -355,4 +404,9 @@ output "instance_id" {
 output "app_url" {
   value       = "http://${aws_lb.main.dns_name}"
   description = "Application URL via ALB"
+}
+
+output "ssm_bucket_name" {
+  value       = aws_s3_bucket.ssm.bucket
+  description = "S3 bucket name used by Ansible SSM connection plugin for file transfer"
 }
