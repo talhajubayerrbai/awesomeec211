@@ -8,18 +8,6 @@ terraform {
   backend "s3" {}
 }
 
-variable "aws_region" {
-  default = "us-east-1"
-}
-
-variable "project_name" {}
-
-variable "instance_type" {
-  default = "t3.micro"
-}
-
-variable "public_key" {}
-
 provider "aws" {
   region = var.aws_region
   default_tags {
@@ -30,8 +18,42 @@ provider "aws" {
   }
 }
 
-#  VPC 
+# 
+# Variables
+# 
+variable "project_name" {}
+variable "aws_region" {}
+variable "public_key" {}
 
+variable "instance_type" {
+  default = "t3.micro"
+}
+
+variable "app_port" {
+  default = 8000
+}
+
+# 
+# Data sources
+# 
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd*/ubuntu-*-24.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# 
+# VPC
+# 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -42,46 +64,35 @@ resource "aws_vpc" "main" {
   }
 }
 
-#  SUBNETS 
-
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
+# 
+# Subnets
+# 
 resource "aws_subnet" "public" {
+  count                   = 2
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
+  cidr_block              = count.index == 0 ? "10.0.1.0/24" : "10.0.3.0/24"
+  availability_zone       = count.index == 0 ? "${var.aws_region}a" : "${var.aws_region}b"
   map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[0]
 
   tags = {
-    Name = "${var.project_name}-public"
-  }
-}
-
-resource "aws_subnet" "public_2" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.3.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = data.aws_availability_zones.available.names[1]
-
-  tags = {
-    Name = "${var.project_name}-public-2"
+    Name = "${var.project_name}-public-${count.index}"
   }
 }
 
 resource "aws_subnet" "private" {
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = data.aws_availability_zones.available.names[0]
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "${var.aws_region}a"
+  map_public_ip_on_launch = false
 
   tags = {
     Name = "${var.project_name}-private"
   }
 }
 
-#  INTERNET GATEWAY 
-
+# 
+# Internet Gateway + Public Route Table
+# 
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 
@@ -89,31 +100,6 @@ resource "aws_internet_gateway" "main" {
     Name = "${var.project_name}-igw"
   }
 }
-
-#  NAT GATEWAY 
-
-resource "aws_eip" "nat_eip" {
-  domain = "vpc"
-
-  tags = {
-    Name = "${var.project_name}-nat-eip"
-  }
-
-  depends_on = [aws_internet_gateway.main]
-}
-
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat_eip.id
-  subnet_id     = aws_subnet.public.id
-
-  tags = {
-    Name = "${var.project_name}-nat"
-  }
-
-  depends_on = [aws_internet_gateway.main]
-}
-
-#  ROUTE TABLES 
 
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
@@ -129,13 +115,33 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
-resource "aws_route_table_association" "public_2" {
-  subnet_id      = aws_subnet.public_2.id
-  route_table_id = aws_route_table.public.id
+# 
+# NAT Gateway (for private subnet outbound)
+# 
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = {
+    Name = "${var.project_name}-nat-eip"
+  }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = {
+    Name = "${var.project_name}-nat-gw"
+  }
+
+  depends_on = [aws_internet_gateway.main]
 }
 
 resource "aws_route_table" "private" {
@@ -156,11 +162,12 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-#  SECURITY GROUPS 
-
+# 
+# Security Groups
+# 
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-alb-sg"
-  description = "Allow HTTP inbound to ALB"
+  description = "ALB security group"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -184,7 +191,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-app-sg"
-  description = "Allow inbound from ALB on app port; allow all egress"
+  description = "App instance security group"
   vpc_id      = aws_vpc.main.id
 
   egress {
@@ -199,31 +206,30 @@ resource "aws_security_group" "app" {
   }
 }
 
-# Break the cycle: express the ALB -> app inbound rule as a standalone resource
-resource "aws_security_group_rule" "app_inbound_from_alb" {
+# Standalone rule to avoid SG cycle: ALB -> app on app_port
+resource "aws_security_group_rule" "app_from_alb" {
   type                     = "ingress"
-  from_port                = 8000
-  to_port                  = 8000
+  from_port                = var.app_port
+  to_port                  = var.app_port
   protocol                 = "tcp"
   security_group_id        = aws_security_group.app.id
   source_security_group_id = aws_security_group.alb.id
-  description              = "Allow TCP 8000 from ALB security group"
+  description              = "Allow traffic from ALB"
 }
 
-#  IAM ROLE FOR SSM 
-
-resource "aws_iam_role" "ssm_role" {
+# 
+# IAM Role for SSM
+# 
+resource "aws_iam_role" "ssm" {
   name = "${var.project_name}-ssm-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect    = "Allow"
-        Principal = { Service = "ec2.amazonaws.com" }
-        Action    = "sts:AssumeRole"
-      }
-    ]
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
   })
 
   tags = {
@@ -231,62 +237,42 @@ resource "aws_iam_role" "ssm_role" {
   }
 }
 
-resource "aws_iam_role_policy_attachment" "ssm_managed" {
-  role       = aws_iam_role.ssm_role.name
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ssm.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_instance_profile" "ssm_profile" {
+resource "aws_iam_instance_profile" "ssm" {
   name = "${var.project_name}-ssm-profile"
-  role = aws_iam_role.ssm_role.name
+  role = aws_iam_role.ssm.name
+
+  tags = {
+    Name = "${var.project_name}-ssm-profile"
+  }
 }
 
-#  SSH KEY PAIR 
-
+# 
+# SSH Key Pair
+# 
 resource "aws_key_pair" "app" {
   key_name   = "${var.project_name}-keypair"
   public_key = var.public_key
-}
 
-#  AMI 
-
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"]
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd*/ubuntu-*-24.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  filter {
-    name   = "state"
-    values = ["available"]
+  tags = {
+    Name = "${var.project_name}-keypair"
   }
 }
 
-#  EC2 INSTANCE 
-
+# 
+# EC2 Instance (private subnet, no public IP)
+# 
 resource "aws_instance" "app" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.private.id
   vpc_security_group_ids = [aws_security_group.app.id]
-  iam_instance_profile   = aws_iam_instance_profile.ssm_profile.name
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
   key_name               = aws_key_pair.app.key_name
-
-  # No public IP - private subnet only
-  associate_public_ip_address = false
-
-  root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
-  }
 
   tags = {
     Name    = "${var.project_name}-app"
@@ -296,14 +282,15 @@ resource "aws_instance" "app" {
   depends_on = [aws_nat_gateway.main]
 }
 
-#  ALB 
-
+# 
+# ALB
+# 
 resource "aws_lb" "main" {
   name               = "${var.project_name}-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = [aws_subnet.public.id, aws_subnet.public_2.id]
+  subnets            = [aws_subnet.public[0].id, aws_subnet.public[1].id]
 
   tags = {
     Name = "${var.project_name}-alb"
@@ -312,7 +299,7 @@ resource "aws_lb" "main" {
 
 resource "aws_lb_target_group" "app" {
   name     = "${var.project_name}-tg"
-  port     = 8000
+  port     = var.app_port
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
 
@@ -334,7 +321,7 @@ resource "aws_lb_target_group" "app" {
 resource "aws_lb_target_group_attachment" "app" {
   target_group_arn = aws_lb_target_group.app.arn
   target_id        = aws_instance.app.id
-  port             = 8000
+  port             = var.app_port
 }
 
 resource "aws_lb_listener" "http" {
@@ -352,19 +339,20 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-#  OUTPUTS 
-
+# 
+# Outputs
+# 
 output "alb_dns_name" {
   value       = aws_lb.main.dns_name
   description = "Public DNS name of the Application Load Balancer"
 }
 
-output "app_url" {
-  value       = "http://${aws_lb.main.dns_name}"
-  description = "Public URL of the application"
-}
-
 output "instance_id" {
   value       = aws_instance.app.id
-  description = "EC2 instance ID (used by Ansible SSM connection plugin)"
+  description = "EC2 instance ID for SSM connection"
+}
+
+output "app_url" {
+  value       = "http://${aws_lb.main.dns_name}"
+  description = "Application URL via ALB"
 }
