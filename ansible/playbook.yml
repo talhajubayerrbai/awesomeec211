@@ -1,37 +1,35 @@
 ---
-- name: Configure application server
+- name: Configure Python/FastAPI application on private EC2 instance
   hosts: all
   become: true
-  gather_facts: true
 
   vars:
     app_dir: /opt/app
-    app_user: ubuntu
     venv_dir: /opt/app/.venv
-    app_port: 8000
-    ansible_remote_tmp: /tmp/.ansible/tmp
+    app_user: ubuntu
+    ansible_remote_tmp: /tmp/.ansible.tmp
 
   tasks:
-    #  SYSTEM PACKAGES 
+    #  1. System packages 
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Install system dependencies
+    - name: Install system packages
       ansible.builtin.apt:
         name:
           - python3.12
           - python3.12-venv
+          - python3.12-dev
           - python3-pip
-          - python3-dev
-          - build-essential
-          - curl
           - git
+          - curl
+          - build-essential
         state: present
 
-    #  APP DIRECTORY 
-    - name: Create app directory
+    #  2. Application directory 
+    - name: Create application directory
       ansible.builtin.file:
         path: "{{ app_dir }}"
         state: directory
@@ -39,7 +37,7 @@
         group: "{{ app_user }}"
         mode: "0755"
 
-    #  COPY APPLICATION SOURCE 
+    #  3. Copy application source 
     - name: Copy app package directory
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../app/"
@@ -67,9 +65,18 @@
 
     - name: Check if public/ directory exists locally
       ansible.builtin.set_fact:
-        public_dir_exists: "{{ lookup('fileglob', playbook_dir + '/../public') | length > 0 }}"
+        public_dir_files: "{{ lookup('fileglob', playbook_dir + '/../public/*', wantlist=True) }}"
 
-    - name: Copy public/ static directory if present
+    - name: Create public directory on remote
+      ansible.builtin.file:
+        path: "{{ app_dir }}/public"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+      when: public_dir_files | length > 0
+
+    - name: Copy public/ directory if it exists
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../public/"
         dest: "{{ app_dir }}/public/"
@@ -77,36 +84,34 @@
         group: "{{ app_user }}"
         mode: "0644"
         directory_mode: "0755"
-      when: public_dir_exists | bool
+      when: public_dir_files | length > 0
 
-    #  PYTHON VIRTUALENV & DEPENDENCIES 
-    - name: Create Python virtual environment
+    #  4. Python virtual environment 
+    - name: Create Python 3.12 virtual environment
       ansible.builtin.command:
         cmd: python3.12 -m venv "{{ venv_dir }}"
         creates: "{{ venv_dir }}/bin/activate"
 
-    - name: Fix venv ownership
+    - name: Set ownership of venv directory to ubuntu
       ansible.builtin.file:
         path: "{{ venv_dir }}"
         state: directory
+        recurse: true
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
-        recurse: true
 
-    - name: Upgrade pip in venv
-      ansible.builtin.pip:
-        name: pip
-        state: latest
-        virtualenv: "{{ venv_dir }}"
-        virtualenv_python: python3.12
+    #  5. Install Python dependencies 
+    - name: Upgrade pip in virtualenv
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/pip install --upgrade pip"
 
-    - name: Install Python dependencies
+    - name: Install application requirements
       ansible.builtin.pip:
         requirements: "{{ app_dir }}/requirements.txt"
         virtualenv: "{{ venv_dir }}"
         virtualenv_python: python3.12
 
-    - name: Install gunicorn and uvicorn in venv
+    - name: Ensure gunicorn and uvicorn are installed
       ansible.builtin.pip:
         name:
           - gunicorn
@@ -114,8 +119,17 @@
         virtualenv: "{{ venv_dir }}"
         virtualenv_python: python3.12
 
-    #  SYSTEMD SERVICE 
-    - name: Deploy systemd unit file
+    #  6. Set final ownership of entire app directory 
+    - name: Set ownership of entire app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        recurse: true
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+
+    #  7. Systemd service 
+    - name: Deploy systemd unit file for app service
       ansible.builtin.copy:
         dest: /etc/systemd/system/app.service
         owner: root
@@ -123,25 +137,24 @@
         mode: "0644"
         content: |
           [Unit]
-          Description=FastAPI Application (gunicorn)
+          Description=FastAPI Application (awesomeec211)
           After=network.target
-          Wants=network-online.target
 
           [Service]
           Type=simple
           User={{ app_user }}
           Group={{ app_user }}
           WorkingDirectory={{ app_dir }}
-          Environment="PATH={{ venv_dir }}/bin"
-          Environment="PORT={{ app_port }}"
           ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
             -k uvicorn.workers.UvicornWorker \
             -w 4 \
-            -b 0.0.0.0:{{ app_port }}
+            -b 0.0.0.0:8000 \
+            --access-logfile - \
+            --error-logfile -
           Restart=always
           RestartSec=5
-          StandardOutput=journal
-          StandardError=journal
+          Environment=APP_ENV=production
+          Environment=PORT=8000
 
           [Install]
           WantedBy=multi-user.target
@@ -152,17 +165,13 @@
 
     - name: Enable and start app service
       ansible.builtin.systemd:
-        name: app.service
+        name: app
         enabled: true
         state: restarted
 
-    - name: Wait for app to be healthy on localhost
-      ansible.builtin.uri:
-        url: "http://localhost:{{ app_port }}/health/"
-        method: GET
-        status_code: [200, 301, 302, 307, 308]
-        follow_redirects: all
-      register: health_result
-      retries: 12
-      delay: 10
-      until: health_result.status in [200, 301, 302, 307, 308]
+    - name: Wait for app to respond on port 8000
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 60
+        delay: 5
