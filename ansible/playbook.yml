@@ -49,29 +49,29 @@
     # 
     - name: Copy main entrypoint
       ansible.builtin.copy:
-        src: main.py
+        src: ../main.py
         dest: "{{ app_dir }}/main.py"
         mode: "0644"
 
     - name: Copy app package directory
       ansible.builtin.copy:
-        src: app/
+        src: ../app/
         dest: "{{ app_dir }}/app/"
         mode: "0644"
 
     - name: Copy requirements.txt
       ansible.builtin.copy:
-        src: requirements.txt
+        src: ../requirements.txt
         dest: "{{ app_dir }}/requirements.txt"
         mode: "0644"
 
     - name: Check if public directory exists locally
       ansible.builtin.set_fact:
-        public_dir_files: "{{ lookup('fileglob', 'public/*', wantlist=True) }}"
+        public_dir_files: "{{ lookup('fileglob', '../public/*', wantlist=True) }}"
 
     - name: Copy public directory if it exists
       ansible.builtin.copy:
-        src: public/
+        src: ../public/
         dest: "{{ app_dir }}/public/"
         mode: "0644"
       when: public_dir_files | length > 0
