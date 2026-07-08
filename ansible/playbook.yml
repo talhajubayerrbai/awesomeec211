@@ -66,13 +66,8 @@
         mode: "0644"
 
     - name: Check if public/ directory exists locally
-      ansible.builtin.stat:
-        path: "{{ playbook_dir }}/../public"
-      register: public_dir
-      delegate_to: localhost
-      become: false
-      vars:
-        ansible_connection: local
+      ansible.builtin.set_fact:
+        public_dir_exists: "{{ lookup('fileglob', playbook_dir + '/../public') | length > 0 }}"
 
     - name: Copy public/ static directory if present
       ansible.builtin.copy:
@@ -82,7 +77,7 @@
         group: "{{ app_user }}"
         mode: "0644"
         directory_mode: "0755"
-      when: public_dir.stat.exists
+      when: public_dir_exists | bool
 
     #  PYTHON VIRTUALENV & DEPENDENCIES 
     - name: Create Python virtual environment
